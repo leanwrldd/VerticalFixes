@@ -295,8 +295,22 @@ void FVerticalLogisticsQoLModule::FixHologramLocking()
 		});
 }
 
+// PORT 1.2 BISECT SWITCH.
+// Set to 1 to re-enable the UpdateTopTransform hook.
+//
+// Sibling of VLQOL_ENABLE_ATTACHMENT_OFFSET_FIX below: both compensate for the game adding
+// an extra 0.5m before calculating steps for vertical connections. 1.2 made attachment
+// placement on lifts freeform, which appears to have retired that behaviour, so the
+// compensation is now applied on top of an already-correct result.
+//
+// Symptom with this hook active: the top ~0.5m of a lift connecting to an attachment is
+// invisible. mTopTransform is shifted up by 50uu AFTER the original has generated the
+// lift, so the mesh stops 0.5m short of where the lift now ends.
+#define VLQOL_ENABLE_LIFT_TOP_TRANSFORM_FIX 0
+
 void FVerticalLogisticsQoLModule::FixLiftOnAttachmentOffByHalf()
 {
+#if VLQOL_ENABLE_LIFT_TOP_TRANSFORM_FIX
 	// If the base of the lift isn't aligned to 1m, then the extra offset should be applied after
 	// rounding to the step height so that you don't just round away the offset. The game does this
 	// properly for passthroughs, but for vertical connections it adds the extra 0.5m before calculating
@@ -337,6 +351,7 @@ void FVerticalLogisticsQoLModule::FixLiftOnAttachmentOffByHalf()
 			top.Z += top.Z >= 0.0f ? 50.0f : -50.0f;
 			hologram->mTopTransform.SetLocation(top);
 		});
+#endif
 }
 
 // PORT 1.2 BISECT SWITCH.

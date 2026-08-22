@@ -109,7 +109,7 @@ void FVerticalLogisticsQoLModule::FixLostPassthroughLinks()
 			if (lift == nullptr)
 				return;
 
-			const TArray<AFGBuildablePassthrough*>& snappedPassthroughs = lift->mSnappedPassthroughs;
+			const auto& snappedPassthroughs = lift->mSnappedPassthroughs;
 
 			if (snappedPassthroughs.Num() != 2)
 				return;	// Shouldn't ever happen?

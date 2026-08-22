@@ -162,7 +162,7 @@ TArray<FItemAmount> AVLQoLConveyorAttachmentHologram::GetBaseCost() const
 {
 	// Use the real recipe when calculating the cost; for some reason some of the attachments have
 	// different costs for their vertical versions.
-	return UFGRecipe::GetIngredients(mRealRecipe);
+	return UFGRecipe::GetIngredients(this, mRealRecipe);
 }
 
 void AVLQoLConveyorAttachmentHologram::PostConstructMessageDeserialization()

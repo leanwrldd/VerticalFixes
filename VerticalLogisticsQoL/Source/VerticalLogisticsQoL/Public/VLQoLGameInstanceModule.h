@@ -47,7 +47,7 @@ private:
 	void FinishSetup(const FStreamableHandle* loadRequest);
 
 	UPROPERTY()
-	TArray<UObject*> CDOEdits;
+	TArray<TObjectPtr<UObject>> CDOEdits;
 
 	UPROPERTY()
 	TMap<TSubclassOf<UFGRecipe>, TSubclassOf<UFGRecipe>> RegularToVerticalRecipeMap;

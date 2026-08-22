@@ -353,6 +353,10 @@ void FVerticalLogisticsQoLModule::FixAttachmentOnLiftOffByHalf()
 
 			float extraOffset;
 
+			// mSnappedPassthroughs is a plain dynamic array with no size guarantee, and Shipping
+			// builds do not bounds-check TArray::operator[]. FixLostPassthroughLinks already
+			// guards this; this site did not.
+			if (lift->mSnappedPassthroughs.Num() > 0)
 			if (const AFGBuildablePassthrough* passthrough = lift->mSnappedPassthroughs[0])
 			{
 				// The lift starts from the center of the passthrough, which means that there's half of the

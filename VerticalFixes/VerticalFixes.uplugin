@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
+	"Version": 1,
 	"VersionName": "1.2.1",
 	"FriendlyName": "VerticalFixes",
 	"Description": "Fixes lots of issues with vertical mergers and splitters. Originally created by NoOp Sledge (github.com/noopsledge) - this is a Satisfactory 1.2 port of their work. NOT TESTED: dedicated servers and multiplayer.",

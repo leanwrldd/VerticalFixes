@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.2.0",
+	"Version": 2,
+	"VersionName": "1.2.1",
 	"FriendlyName": "VerticalLogisticsQoL",
-	"Description": "Fixes lots of issues with vertical mergers and splitters.",
+	"Description": "Fixes lots of issues with vertical mergers and splitters. Satisfactory 1.2 port by freakysaint; original mod by NoOp Sledge. NOT TESTED: dedicated servers and multiplayer.",
 	"Category": "Modding",
 	"CreatedBy": "NoOp Sledge",
 	"CreatedByURL": "",
@@ -29,6 +29,6 @@
 			"SemVersion": "^3.12.0"
 		}
 	],
-	"SemVersion": "1.2.0",
+	"SemVersion": "1.2.1",
 	"GameVersion": ">=491125"
 }

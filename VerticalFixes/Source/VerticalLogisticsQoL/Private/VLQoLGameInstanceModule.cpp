@@ -28,7 +28,11 @@ UVLQoLGameInstanceModule* UVLQoLGameInstanceModule::Get(UWorld* world)
 		{
 			if (auto* manager = gameInstance->GetSubsystem<UGameInstanceModuleManager>())
 			{
-				auto* module = manager->FindModule(UE_MODULE_NAME);
+				// FindModule keys on the MOD REFERENCE (the plugin name), not the module name.
+				// Those differ: the plugin is VerticalFixes while the C++ module is still
+				// VerticalLogisticsQoL, so UE_MODULE_NAME would look up the wrong key and
+				// return null.
+				auto* module = manager->FindModule(TEXT("VerticalFixes"));
 				return Cast<UVLQoLGameInstanceModule>(module);
 			}
 		}

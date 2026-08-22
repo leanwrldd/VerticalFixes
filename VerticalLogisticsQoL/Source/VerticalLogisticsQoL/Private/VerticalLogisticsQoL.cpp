@@ -339,8 +339,24 @@ void FVerticalLogisticsQoLModule::FixLiftOnAttachmentOffByHalf()
 		});
 }
 
+// PORT 1.2 BISECT SWITCH.
+// Set to 1 to re-enable the FindOffsetClosestToLocation hook.
+//
+// With this hook active, 1.2 crashes during hologram placement:
+//   EXCEPTION_ACCESS_VIOLATION writing 0x1
+//   AFGBuildableConveyorLift::GetLocationAndDirectionAtOffset()
+//   <- this lambda, inside the scope() call to the original
+//   <- AFGConveyorAttachmentHologram::CheckValidPlacement()
+// The fault is in stock game code, reached before any of our logic runs, so it cannot be
+// fixed by guarding our own code.
+//
+// Note the "Looks like the bug has been fixed?" escape hatch below: if vanilla 1.2 now
+// rounds this offset correctly, the right outcome is deleting this hook, not repairing it.
+#define VLQOL_ENABLE_ATTACHMENT_OFFSET_FIX 0
+
 void FVerticalLogisticsQoLModule::FixAttachmentOnLiftOffByHalf()
 {
+#if VLQOL_ENABLE_ATTACHMENT_OFFSET_FIX
 	// The offset used for placing attachment on lifts doesn't account for the extra length added by
 	// vertical connections, which can push it off grid.
 
@@ -381,6 +397,7 @@ void FVerticalLogisticsQoLModule::FixAttachmentOnLiftOffByHalf()
 
 			scope.Override(offset + FMath::Sign(offset) * extraOffset);
 		});
+#endif
 }
 
 void FVerticalLogisticsQoLModule::FixClearanceWarnings()

@@ -306,7 +306,7 @@ void FVerticalLogisticsQoLModule::FixHologramLocking()
 // Symptom with this hook active: the top ~0.5m of a lift connecting to an attachment is
 // invisible. mTopTransform is shifted up by 50uu AFTER the original has generated the
 // lift, so the mesh stops 0.5m short of where the lift now ends.
-#define VLQOL_ENABLE_LIFT_TOP_TRANSFORM_FIX 0
+#define VLQOL_ENABLE_LIFT_TOP_TRANSFORM_FIX 1
 
 void FVerticalLogisticsQoLModule::FixLiftOnAttachmentOffByHalf()
 {
@@ -350,6 +350,13 @@ void FVerticalLogisticsQoLModule::FixLiftOnAttachmentOffByHalf()
 			FVector top = hologram->mTopTransform.GetLocation();
 			top.Z += top.Z >= 0.0f ? 50.0f : -50.0f;
 			hologram->mTopTransform.SetLocation(top);
+
+			// The lift's meshes are generated inside the original call, from the transform as
+			// it stood then. Moving the transform afterwards leaves the geometry 0.5m short,
+			// which shows in game as an invisible segment where the lift meets the attachment.
+			// mTopTransform is ReplicatedUsing=OnRep_TopTransform, so that handler is the
+			// game's own "transform changed, rebuild from it" path - run it to resync.
+			hologram->OnRep_TopTransform();
 		});
 #endif
 }

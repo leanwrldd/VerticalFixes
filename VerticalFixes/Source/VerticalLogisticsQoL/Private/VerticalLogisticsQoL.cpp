@@ -5,10 +5,16 @@
 #include "Buildables/FGBuildablePassthrough.h"
 #include "Equipment/FGBuildGunBuild.h"
 #include "FGFactoryConnectionComponent.h"
+#include "FGPipeConnectionComponent.h"
 #include "Hologram/FGConveyorAttachmentHologram.h"
 #include "Hologram/FGConveyorLiftHologram.h"
+#include "Hologram/FGPipelineHologram.h"
+#include "Hologram/FGPipelinePoleHologram.h"
+#include "Hologram/FGWallAttachmentHologram.h"
 #include "Net/UnrealNetwork.h"
 #include "Patching/NativeHookManager.h"
+#include "VLQoLBuildModes.h"
+#include "VLQoLModConfiguration.h"
 #include "VLQoLGameInstanceModule.h"
 
 DEFINE_LOG_CATEGORY(LogVerticalLogisticsQoL)
@@ -60,6 +66,7 @@ void FVerticalLogisticsQoLModule::StartupModule()
 		AllowConnectionToExistingAttachment();
 		HideLiftArrowWhenSnappedTopToAttachment();
 		PrepareCustomAttachmentHologram();
+		AddPipeBetterStraightBuildMode();
 		NetworkVerticalAttachmentFlowDirection();
 		NetworkLiftMeshRotationFlag();
 	}
@@ -623,6 +630,800 @@ void FVerticalLogisticsQoLModule::PrepareCustomAttachmentHologram()
 				{
 					scope(state, overrideRecipe);
 				}
+			}
+		});
+}
+
+// Quarter turns the player has given a Better Straight pipe's free end pole with the scroll wheel, per hologram.
+static TMap<TWeakObjectPtr<AFGPipelineHologram>, int32> GPipeEndQuarterTurns;
+
+// The direction a Better Straight pipe's free start pole faced when the end started being placed, per hologram.
+// The pole itself is turned to follow the pipe after that, so it can't be read back.
+static TMap<TWeakObjectPtr<AFGPipelineHologram>, FVector2D> GPipeStartForward;
+
+// The wall pole a Better Straight pipe ends on, with its wall normal and the axis the pipe passes through it on,
+// per hologram, from the last route. Only set when the route was used rather than falling back to auto.
+struct FPipeEndWallPole
+{
+	TWeakObjectPtr<AFGWallAttachmentHologram> Pole;
+	FVector WallNormal;
+	FVector PassAxis;
+};
+static TMap<TWeakObjectPtr<AFGPipelineHologram>, FPipeEndWallPole> GPipeEndWallPole;
+
+// The same for a wall pole the pipe starts from, squared to a quarter turn when it was left at 45 degrees.
+static TMap<TWeakObjectPtr<AFGPipelineHologram>, FPipeEndWallPole> GPipeStartWallPole;
+
+void FVerticalLogisticsQoLModule::AddPipeBetterStraightBuildMode()
+{
+	// The game's Straight mode keeps a pipe level, and Horizontal-to-Vertical keeps it level then plumb.
+	// Better Straight combines them: every straight run is either level along one of the start's two
+	// horizontal axes, or plumb, like Straight extended into the vertical.
+
+	// Whether end i of the pipe is free (on a pole) rather than snapped to a real port. Ending on a wall, the
+	// game snaps the pipe to its own child wall pole's connection, which is still a free end for us.
+	static const auto isFreePipeEnd = [](const AFGPipelineHologram* hologram, int32 i)
+	{
+		const UFGPipeConnectionComponentBase* connection = hologram->mSnappedConnectionComponents[i];
+		return connection == nullptr || Cast<AFGHologram>(connection->GetOwner()) != nullptr;
+	};
+
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, GetSupportedBuildModes_Implementation,
+		[](const AFGPipelineHologram* hologram, TArray<TSubclassOf<UFGBuildGunModeDescriptor>>& out_buildmodes)
+		{
+			// With the setting on, our mode takes vanilla Straight's place in the list instead of being added.
+			UClass* vanillaStraight = hologram->mBuildModeStraight.Get();
+			UClass* betterStraight = UVLQoLPipeBetterStraightBuildMode::StaticClass();
+			auto isVanillaStraight = [vanillaStraight](const TSubclassOf<UFGBuildGunModeDescriptor>& mode) { return mode.Get() == vanillaStraight; };
+			if (GVLQoLReplaceVanillaStraight && vanillaStraight != nullptr && out_buildmodes.ContainsByPredicate(isVanillaStraight))
+			{
+				out_buildmodes.Remove(betterStraight);
+				out_buildmodes[out_buildmodes.IndexOfByPredicate(isVanillaStraight)] = betterStraight;
+			}
+			else
+			{
+				out_buildmodes.AddUnique(betterStraight);
+			}
+		});
+
+	// The scroll wheel turns the pipe's poles to any angle. While the start is being placed that sets the
+	// direction the pipe leaves in, which is what we want. Once the end is being placed it would turn the
+	// end pole to any angle, which moves its connector, and with it the end of the route, off the start's
+	// axes. Instead it steps the direction the pipe arrives at the end pole through straight on, a quarter
+	// turn left and a quarter turn right, which the route below keeps on the start's axes. (A half turn
+	// would make a level pipe double back on itself at the end, with no room for a bend.)
+
+	SUBSCRIBE_METHOD_VIRTUAL(AFGPipelineHologram::Scroll, GetDefault<AFGPipelineHologram>(),
+		[](auto& scope, AFGPipelineHologram* hologram, int32 delta)
+		{
+			if (!hologram->IsCurrentBuildMode(UVLQoLPipeBetterStraightBuildMode::StaticClass())
+				|| hologram->GetUpgradedActor() != nullptr)
+				return;
+			const ESplineHologramBuildStep step = hologram->GetCurrentBuildStep();
+			if (step == ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding || step == ESplineHologramBuildStep::SHBS_AdjustPole)
+			{
+				const int32 turns = GPipeEndQuarterTurns.FindOrAdd(hologram) += delta > 0 ? 1 : -1;
+				UE_LOG(LogVerticalLogisticsQoL, Display, TEXT("BetterStraight: pipeline scroll %d, end turns now %d"), delta, turns);
+				scope.Cancel();
+			}
+			else if (step == ESplineHologramBuildStep::SHBS_FindStart || step == ESplineHologramBuildStep::SHBS_AdjustStartingPole)
+			{
+				// A wall pole scrolls in eighth turns, which would start the pipe at 45 degrees. Turn a start on
+				// a wall a quarter turn at a time instead.
+				AFGWallAttachmentHologram* wallPole = hologram->mChildWallPoleHologram[0];
+				if (IsValid(wallPole) && !wallPole->IsHidden())
+				{
+					const int32 squared = FMath::RoundToInt(wallPole->GetScrollRotateValue() / 90.0) * 90;
+					wallPole->SetScrollRotateValue(((squared + (delta > 0 ? 90 : -90)) % 360 + 360) % 360);
+					UE_LOG(LogVerticalLogisticsQoL, Display, TEXT("BetterStraight: start wall pole scroll %d, rotation now %d"), delta, wallPole->GetScrollRotateValue());
+					scope.Cancel();
+				}
+			}
+		});
+
+	// Ending on a wall, the scroll may go straight to the child wall pole hologram rather than through the
+	// pipeline. AFGWallAttachmentHologram doesn't override Scroll, so this hooks AFGHologram::Scroll and
+	// filters for a wall pole whose parent is a Better Straight pipe placing its end.
+
+	SUBSCRIBE_METHOD_VIRTUAL(AFGHologram::Scroll, GetDefault<AFGWallAttachmentHologram>(),
+		[](auto& scope, AFGHologram* self, int32 delta)
+		{
+			if (!self->IsA<AFGWallAttachmentHologram>())
+				return;
+			AFGPipelineHologram* pipeline = Cast<AFGPipelineHologram>(self->GetParentHologram());
+			if (pipeline == nullptr || !pipeline->IsCurrentBuildMode(UVLQoLPipeBetterStraightBuildMode::StaticClass())
+				|| pipeline->GetUpgradedActor() != nullptr)
+				return;
+			const ESplineHologramBuildStep step = pipeline->GetCurrentBuildStep();
+			if (step == ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding || step == ESplineHologramBuildStep::SHBS_AdjustPole)
+			{
+				const int32 turns = GPipeEndQuarterTurns.FindOrAdd(pipeline) += delta > 0 ? 1 : -1;
+				UE_LOG(LogVerticalLogisticsQoL, Display, TEXT("BetterStraight: wall pole scroll %d, end turns now %d"), delta, turns);
+				scope.Cancel();
+			}
+		});
+
+	// The route can leave a free start pole the opposite way to (or square to) the way it faces, see below,
+	// and can reach a free end pole from any side, so the pipe would come out of the back or side of a pole.
+	// After every re-route while the end is being placed, turn both free poles to match the ends of the pipe
+	// (UpdateSplineComponent has already moved the pipe's connections to the new spline). This is the same
+	// call the game makes for the start pole on one of its own paths through GenerateAndUpdateSpline.
+
+	SUBSCRIBE_METHOD_AFTER(AFGPipelineHologram::GenerateAndUpdateSpline,
+		[](AFGPipelineHologram* hologram, const FHitResult& hitResult)
+		{
+			if (!hologram->IsCurrentBuildMode(UVLQoLPipeBetterStraightBuildMode::StaticClass()))
+				return;
+			if (hologram->GetUpgradedActor() != nullptr)
+				return;
+			const ESplineHologramBuildStep step = hologram->GetCurrentBuildStep();
+
+			// After routing, the game turns an end wall pole to face the start (projected onto the wall), which
+			// tilts it off the scroll rotation and off the route. Turn it back so the pipe passes straight
+			// through it along the route.
+			if (step == ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding || step == ESplineHologramBuildStep::SHBS_AdjustPole)
+			{
+				for (const FPipeEndWallPole* endWallPole : { GPipeEndWallPole.Find(hologram), GPipeStartWallPole.Find(hologram) })
+				{
+					AFGWallAttachmentHologram* wallPole = endWallPole ? endWallPole->Pole.Get() : nullptr;
+					if (IsValid(wallPole) && !wallPole->IsHidden())
+						wallPole->SetActorRotation(FRotationMatrix::MakeFromXY(endWallPole->WallNormal, endWallPole->PassAxis).Rotator());
+				}
+			}
+
+			if (step != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding)
+				return;
+
+			for (int32 i = 0; i < 2; ++i)
+			{
+				if (!isFreePipeEnd(hologram, i))
+					continue;
+				AFGPipelinePoleHologram* pole = hologram->mChildPoleHologram[i];
+				UFGPipeConnectionComponentBase* connection = hologram->mConnectionComponents[i];
+				if (IsValid(pole) && !pole->IsHidden() && IsValid(connection))
+					pole->SnapToConnection(connection, hologram);
+			}
+		});
+
+	// The route is a path of corners: from a horizontal start, a run along the start direction, a run
+	// across to below/above the end, then a plumb run to the end; from a vertical start, a plumb run to
+	// the end's height, then a level run to the end. Runs that would be shorter than a centimetre are
+	// dropped, so a level pipe is vanilla Straight's L and a pipe straight ahead is one straight segment.
+	// Each corner is then rounded with an arc of the bend radius vanilla Straight uses (mBendRadius, which
+	// AutoRouteStraightSpline reads; mBendRadius2D is wider and looked too curvy), shrunk where a run is too
+	// short for it; validation still rejects a bend tighter than the game allows.
+	//
+	// RouteSelectedSplineMode falls back to AutoRouteSpline for modes it doesn't know, so the hook routes
+	// our mode itself. GenerateAndUpdateSpline (from PostHologramPlacement) calls UpdateSplineComponent
+	// straight after, which rebuilds the meshes and connections, so replacing the spline data here is enough.
+	//
+	// Hooking SetHologramLocationAndRotation does NOT work: in 1.2 the pipe version only positions the
+	// child pole holograms, and the spline is re-routed afterwards in PostHologramPlacement.
+
+	SUBSCRIBE_METHOD_AFTER(AFGPipelineHologram::RouteSelectedSplineMode,
+		[](AFGPipelineHologram* hologram, FVector startLocation, FVector startNormal, FVector endLocation, FVector endNormal)
+		{
+			if (!hologram->IsCurrentBuildMode(UVLQoLPipeBetterStraightBuildMode::StaticClass()))
+				return;
+			if (hologram->GetUpgradedActor() != nullptr)
+				return;	// Replacing an existing pipe, which keeps its own shape.
+
+			// Before the start is placed the hologram is only a preview stub at the cursor (both ends at the
+			// same pole), and routing it would turn it into a loop, so leave vanilla's preview alone.
+			const ESplineHologramBuildStep step = hologram->GetCurrentBuildStep();
+			if (step != ESplineHologramBuildStep::SHBS_PlacePoleOrSnapEnding && step != ESplineHologramBuildStep::SHBS_AdjustPole)
+			{
+				// A new pipe starts with the default end direction, and its start direction isn't set yet.
+				GPipeEndQuarterTurns.Remove(hologram);
+				GPipeStartForward.Remove(hologram);
+				GPipeEndWallPole.Remove(hologram);
+				GPipeStartWallPole.Remove(hologram);
+				return;
+			}
+			GPipeEndWallPole.Remove(hologram);
+			GPipeStartWallPole.Remove(hologram);
+			if ((endLocation - startLocation).Size() < 1.0)
+				return;
+
+			TArray<FVector> corners;
+			corners.Add(startLocation);
+
+			// A pipe hole in a floor, ceiling or wall is a passthrough, which has no pipe connection, so an end
+			// snapped into one looks free. It's really a port facing through the hole (startNormal/endNormal),
+			// so treat it as snapped: no pole to lead into or turn.
+			bool startsInPassthrough = false;
+			bool endsInPassthrough = false;
+			for (const AFGBuildablePassthrough* passthrough : hologram->mSnappedPassthroughs)
+			{
+				if (passthrough == nullptr)
+					continue;
+				const FVector passthroughLocation = passthrough->GetActorLocation();
+				if (FVector::Dist(passthroughLocation, endLocation) < FVector::Dist(passthroughLocation, startLocation))
+					endsInPassthrough = true;
+				else
+					startsInPassthrough = true;
+			}
+
+			const bool isFreeStart = isFreePipeEnd(hologram, 0) && !startsInPassthrough;
+
+			// A start snapped to a sloped port (the end of a pipe that was still turning) faces neither level
+			// nor plumb. Carry on along the port just far enough for a bend of the bend radius to straighten
+			// out to the nearest of level or plumb, and route on from there.
+			FVector routeStart = startLocation;
+			if (!isFreeStart)
+			{
+				const FVector portDirection = startNormal.GetSafeNormal();
+				const FVector2D portHorizontal(portDirection.X, portDirection.Y);
+				if (FMath::Abs(portDirection.Z) > 0.01 && portHorizontal.Size() > 0.01)
+				{
+					const FVector straightened = FMath::Abs(portDirection.Z) > 0.7
+						? FVector(0.0, 0.0, FMath::Sign(portDirection.Z))
+						: FVector(portHorizontal.GetSafeNormal(), 0.0);
+					const double tilt = FMath::Acos(FMath::Clamp(FVector::DotProduct(portDirection, straightened), -1.0, 1.0));
+					routeStart = startLocation + portDirection * (hologram->mBendRadius * FMath::Tan(tilt / 2.0));
+					corners.Add(routeStart);
+				}
+			}
+
+			const bool hasHeight = FMath::Abs(endLocation.Z - routeStart.Z) >= 1.0;
+			const FVector2D end2D(endLocation.X, endLocation.Y);
+			const FVector2D startToEnd = end2D - FVector2D(routeStart);
+
+			// The world grid axis pointing most towards the end.
+			FVector2D axisForward = FVector2D::ZeroVector;
+			if (FMath::Abs(startToEnd.X) >= FMath::Abs(startToEnd.Y) && FMath::Abs(startToEnd.X) >= 1.0)
+				axisForward = FVector2D(FMath::Sign(startToEnd.X), 0.0);
+			else if (FMath::Abs(startToEnd.Y) >= 1.0)
+				axisForward = FVector2D(0.0, FMath::Sign(startToEnd.Y));
+
+			// A free start on a wall is a wall pole, which can't be turned, and whose connector can really face
+			// up or down. A free start elsewhere is a floor pole, whose connector always faces sideways.
+			AFGWallAttachmentHologram* startWallPole = hologram->mChildWallPoleHologram[0];
+			const bool isWallStart = isFreeStart && IsValid(startWallPole) && !startWallPole->IsHidden();
+
+			const FVector gameStartNormal = startNormal;
+
+			// A wall pole the pipe starts from may have been left at 45 degrees. Its X axis is out of the wall
+			// and the pipe runs through it along its Y axis: square that to straight up or down, or level along
+			// the wall (on a ceiling or floor, to the nearest world axis), and start the pipe that way. The pole
+			// is turned to match after routing, like an end wall pole.
+			TOptional<FPipeEndWallPole> squaredStartWallPole;
+			FVector startWallNormal = FVector::ZeroVector;
+			if (isWallStart)
+			{
+				const FTransform poleTransform = startWallPole->GetActorTransform();
+				const FVector wallNormal = poleTransform.GetUnitAxis(EAxis::X);
+				startWallNormal = wallNormal;
+				const FVector poleAxis = poleTransform.GetUnitAxis(EAxis::Y);
+				FVector squaredAxis;
+				if (FMath::Abs(wallNormal.Z) < 0.7)
+				{
+					const FVector alongWall = FVector::CrossProduct(FVector::UpVector, wallNormal).GetSafeNormal();
+					squaredAxis = FMath::Abs(poleAxis.Z) >= 0.5
+						? FVector(0.0, 0.0, FMath::Sign(poleAxis.Z))
+						: alongWall * FMath::Sign(FVector::DotProduct(poleAxis, alongWall));
+				}
+				else
+				{
+					squaredAxis = FMath::Abs(poleAxis.X) >= FMath::Abs(poleAxis.Y)
+						? FVector(FMath::Sign(poleAxis.X), 0.0, 0.0)
+						: FVector(0.0, FMath::Sign(poleAxis.Y), 0.0);
+				}
+				// Always start along the pole: like an end wall pole's endNormal, the startNormal the game passes
+				// for a wall pole needn't follow the pole.
+				if (!squaredAxis.IsZero())
+				{
+					// The pipe can go through from either side; leave towards the end.
+					if (FVector::DotProduct(squaredAxis, endLocation - startLocation) < 0.0)
+						squaredAxis = -squaredAxis;
+					startNormal = squaredAxis;
+					squaredStartWallPole = (FPipeEndWallPole{ startWallPole, wallNormal, squaredAxis });
+				}
+			}
+
+			const FVector2D startForward = FVector2D(startNormal.X, startNormal.Y).GetSafeNormal();
+			FVector2D forward = startForward.IsZero() ? axisForward : startForward;
+			if (isFreeStart && !isWallStart)
+			{
+				// A free start is a pole, and the player sets the pipe's direction by turning it with the scroll
+				// wheel before placing it. A floor pole hung from a ceiling has a vertical start normal, but its
+				// connector still faces sideways along the pole.
+				if (const FVector2D* storedForward = GPipeStartForward.Find(hologram))
+				{
+					forward = *storedForward;
+				}
+				else
+				{
+					if (startForward.IsZero() && !isWallStart)
+					{
+						if (AFGPipelinePoleHologram* pole = hologram->mChildPoleHologram[0])
+						{
+							const FVector poleForward = pole->GetActorForwardVector();
+							const FVector2D poleDirection = FVector2D(poleForward.X, poleForward.Y).GetSafeNormal();
+							if (!poleDirection.IsZero())
+								forward = poleDirection;
+						}
+					}
+					GPipeStartForward.Add(hologram, forward);
+				}
+
+				// Leave along that axis towards the end, so an end behind the pole doesn't bend back on itself.
+				// An end square to the side would give no run along the axis at all, so turn to face it. A wall
+				// pole can't turn, so a start on a wall always leaves straight out of the wall.
+				const double ahead = FVector2D::DotProduct(startToEnd, forward);
+				if (!isWallStart)
+				{
+					if (FMath::Abs(ahead) < 1.0 && startToEnd.Size() >= 1.0)
+					{
+						const FVector2D side(-forward.Y, forward.X);
+						forward = FVector2D::DotProduct(startToEnd, side) >= 0.0 ? side : -side;
+					}
+					else if (ahead < 0.0)
+					{
+						forward = -forward;
+					}
+				}
+			}
+
+			const double bendRadius = hologram->mBendRadius;
+			const FVector2D left(-forward.Y, forward.X);
+
+			// A free end is a pole, whose connector faces sideways, so the pipe has to arrive level. The level
+			// route goes to a point a bend radius short of the end (levelTarget2D), any plumb run is made there,
+			// and the pipe bends into a final level run into the pole.
+			//
+			// On a wall that's a wall pole. The scroll wheel turns it in quarter turns (all four: up, down and
+			// both ways along the wall), set here and picked up when the pole is next placed, so endNormal
+			// follows a frame later. If its connector faces level the pipe arrives along it, and if it faces up
+			// or down the pipe arrives on a plumb run (endArrivesPlumb).
+			//
+			// A floor pole arrives on one of the start's axes: by default the way the level route was already
+			// heading, or a quarter turn either way with the scroll wheel. The game turns the pole to match.
+			const bool isFreeEnd = isFreePipeEnd(hologram, 1) && !endsInPassthrough;
+			// The start's wall pole can be close to the end too, so take the one nearer the end than the start.
+			AFGWallAttachmentHologram* endWallPole = nullptr;
+			double endWallPoleDistance = TNumericLimits<double>::Max();
+			for (int32 i = 0; i < 2; ++i)
+			{
+				AFGWallAttachmentHologram* wallPole = hologram->mChildWallPoleHologram[i];
+				if (!IsValid(wallPole) || wallPole->IsHidden())
+					continue;
+				const double distance = FVector::Dist(wallPole->GetActorLocation(), endLocation);
+				if (distance < endWallPoleDistance && distance < FVector::Dist(wallPole->GetActorLocation(), startLocation))
+				{
+					endWallPole = wallPole;
+					endWallPoleDistance = distance;
+				}
+			}
+
+			// Diagnostics for wall ends, logged only when something changes.
+			{
+				static FString lastEndState;
+				const UFGPipeConnectionComponentBase* snappedEnd = hologram->mSnappedConnectionComponents[1];
+				const AFGWallAttachmentHologram* wallPole0 = hologram->mChildWallPoleHologram[0];
+				const AFGWallAttachmentHologram* wallPole1 = hologram->mChildWallPoleHologram[1];
+				const AFGPipelinePoleHologram* floorPole1 = hologram->mChildPoleHologram[1];
+				auto describeWallPole = [&](const AFGWallAttachmentHologram* wallPole)
+				{
+					if (wallPole == nullptr)
+						return FString(TEXT("None"));
+					const FTransform poleTransform = wallPole->GetActorTransform();
+					return FString::Printf(TEXT("%s hidden=%d dEnd=%.0f dStart=%.0f X=%s Y=%s Z=%s"),
+						*wallPole->GetName(), wallPole->IsHidden() ? 1 : 0,
+						FVector::Dist(wallPole->GetActorLocation(), endLocation), FVector::Dist(wallPole->GetActorLocation(), startLocation),
+						*poleTransform.GetUnitAxis(EAxis::X).ToCompactString(), *poleTransform.GetUnitAxis(EAxis::Y).ToCompactString(),
+						*poleTransform.GetUnitAxis(EAxis::Z).ToCompactString());
+				};
+				const FString endState = FString::Printf(
+					TEXT("BetterStraight end: free=%d snapped=%s owner=%s floorPole1=%s hidden=%d | wallPole0=%s | wallPole1=%s | endWallPole=%s scrollRotation=%d turns=%d bendRadius=%.0f endNormal=%s"),
+					isFreeEnd ? 1 : 0, *GetNameSafe(snappedEnd), *GetNameSafe(snappedEnd ? snappedEnd->GetOwner() : nullptr),
+					*GetNameSafe(floorPole1), floorPole1 ? (floorPole1->IsHidden() ? 1 : 0) : -1,
+					*describeWallPole(wallPole0), *describeWallPole(wallPole1),
+					*GetNameSafe(endWallPole), endWallPole ? endWallPole->GetScrollRotateValue() : -1,
+					GPipeEndQuarterTurns.FindRef(hologram), bendRadius, *endNormal.GetSafeNormal().ToCompactString());
+				if (endState != lastEndState)
+				{
+					UE_LOG(LogVerticalLogisticsQoL, Display, TEXT("%s"), *endState);
+					lastEndState = endState;
+				}
+			}
+
+			FVector2D endArriveDirection = FVector2D::ZeroVector;
+			bool endArrivesPlumb = false;
+			FVector endWallNormal = FVector::ZeroVector;
+
+			// An end snapped to a port facing up or down (a floor or ceiling pipe hole, the top of a vertical
+			// pipe) is arrived at on a plumb run. Into a pipe hole its last bend is often short of a full radius,
+			// since a pole's default height above the floor is less than that, so it may shrink to fit (see below).
+			const bool endsOnPlumbPort = !isFreeEnd && FMath::Abs(endNormal.GetSafeNormal().Z) > 0.7;
+			if (endsOnPlumbPort)
+				endArrivesPlumb = true;
+
+			// An end snapped to a level port (a machine, the end of another pipe) is arrived at straight along
+			// the port, or the joint kinks. The port's normal faces out of it, so the pipe arrives against it.
+			// endNormal isn't used for this, since it can follow the auto route rather than the port.
+			bool endsOnLevelPort = false;
+			if (!isFreeEnd && !endsOnPlumbPort)
+			{
+				if (const UFGPipeConnectionComponentBase* port = hologram->mSnappedConnectionComponents[1])
+				{
+					const FVector portNormal = port->GetConnectorNormal();
+					const FVector2D portDirection = FVector2D(portNormal.X, portNormal.Y).GetSafeNormal();
+					if (!portDirection.IsZero())
+					{
+						endArriveDirection = -portDirection;
+						endsOnLevelPort = true;
+					}
+				}
+			}
+
+			if (isFreeEnd && endWallPole != nullptr)
+			{
+				// The pipe runs through the wall pole along its Y axis. Its X axis is out of the wall, and the
+				// scroll rotation rolls it about that: on an upright wall, 0 and 180 run along the wall and 90 and
+				// 270 run up and down it. Neither endNormal nor the pole's current rotation can be used for the
+				// direction, since the game tilts both to follow the pipe's own end, which feeds back.
+				//
+				// The ring is the same from either side, so on an upright wall the scroll wheel steps through three
+				// ways in: along the wall carrying on away from the start, plumb, and along the wall coming back
+				// towards the start. On a ceiling or floor it steps through all four level directions.
+				const FVector wallNormal = endWallPole->GetActorTransform().GetUnitAxis(EAxis::X);
+				endWallNormal = wallNormal;
+				const bool isUprightWall = FMath::Abs(wallNormal.Z) < 0.7;
+				const int32 turns = GPipeEndQuarterTurns.FindRef(hologram);
+				const int32 wallState = isUprightWall ? (turns % 3 + 3) % 3 : (turns % 4 + 4) % 4;
+				const int32 wallPoleRotation = isUprightWall ? (wallState == 1 ? 90 : 0) : wallState * 90;
+				if (endWallPole->GetScrollRotateValue() != wallPoleRotation)
+					endWallPole->SetScrollRotateValue(wallPoleRotation);
+
+				if (isUprightWall && wallState == 1)
+				{
+					endArrivesPlumb = true;
+				}
+				else
+				{
+					const FVector passAxis = isUprightWall
+						? FVector::CrossProduct(FVector::UpVector, wallNormal)
+						: endWallPole->GetActorTransform().GetUnitAxis(EAxis::Y);
+					endArriveDirection = FVector2D(passAxis.X, passAxis.Y).GetSafeNormal();
+					if (FVector2D::DotProduct(endArriveDirection, startToEnd) < 0.0)
+						endArriveDirection = -endArriveDirection;
+					if (isUprightWall ? wallState == 2 : wallState >= 2)
+						endArriveDirection = -endArriveDirection;
+				}
+			}
+			else if (isFreeEnd && !forward.IsZero())
+			{
+				// Arriving from the side needs room for a run across and the final run: two bend radii.
+				const double ahead = FVector2D::DotProduct(startToEnd, forward);
+				const double lateral = FVector2D::DotProduct(startToEnd, left);
+				if (FMath::Abs(lateral) >= 2.0 * bendRadius)
+					endArriveDirection = lateral > 0.0 ? left : -left;
+				else
+					endArriveDirection = ahead >= 1.0 ? forward : -forward;
+
+				const int32 turn = (GPipeEndQuarterTurns.FindRef(hologram) % 3 + 3) % 3;
+				if (turn == 1)
+					endArriveDirection = FVector2D(-endArriveDirection.Y, endArriveDirection.X);
+				else if (turn == 2)
+					endArriveDirection = FVector2D(endArriveDirection.Y, -endArriveDirection.X);
+			}
+
+			// An offset of less than two bend radii can't be made with two full bends: squeezed in, the bends
+			// overshoot and the pipe dips and comes back. Instead the final run into the end pole takes it on
+			// as a gentle slope, lengthened to keep that slope to about 20 degrees. That covers a small height
+			// difference from a horizontal start, and a small sideways offset when arriving straight on.
+			const bool isVerticalStart = FMath::Abs(startNormal.Z) > 0.7 || startForward.IsZero();
+			const double heightToEnd = endLocation.Z - routeStart.Z;
+			const bool hasLead = !endArriveDirection.IsZero();
+			const bool rampsHeight = hasLead && !endsOnLevelPort && !isVerticalStart && hasHeight && FMath::Abs(heightToEnd) < 2.0 * bendRadius;
+			double rampedLateral = 0.0;
+			if (hasLead && !endsOnLevelPort && endWallPole == nullptr && FMath::Abs(FVector2D::DotProduct(endArriveDirection, forward)) > 0.5)
+			{
+				const double lateral = FVector2D::DotProduct(startToEnd, left);
+				if (FMath::Abs(lateral) < 2.0 * bendRadius)
+					rampedLateral = lateral;
+			}
+			const double rampedOffset = FMath::Max(FMath::Abs(rampedLateral), rampsHeight ? FMath::Abs(heightToEnd) : 0.0);
+			double leadLength = FMath::Max((double)bendRadius, rampedOffset * 2.75);
+			bool sharesRoom = false;
+
+			// Arriving the way the start faces from well off to the side takes two turns along the start's
+			// direction, a bend radius each. When the end isn't two bend radii ahead, share what room there is
+			// between the run out of the start and the final run, so both bends shrink alike.
+			const double endAhead = FVector2D::DotProduct(startToEnd, forward);
+			if (hasLead && rampedLateral == 0.0 && FVector2D::DotProduct(endArriveDirection, forward) > 0.5
+				&& endAhead > 0.0 && endAhead < 2.0 * leadLength)
+			{
+				leadLength = endAhead / 2.0;
+				sharesRoom = true;
+			}
+
+			const FVector2D levelTarget2D = hasLead ? end2D - endArriveDirection * leadLength - left * rampedLateral : end2D;
+
+			// Level route at height z from the last corner to levelTarget2D: along forward, then across. Within
+			// ~3.6 degrees of straight ahead from a port counts as straight ahead, the same tolerance vanilla
+			// Straight passes to FSplineUtils::BuildStraightSpline3D (cos 0.998). A free start's direction is the
+			// player's choice, so it gets an exact L instead.
+			//
+			// When the target is beside or behind the start, an L would cut straight back across the start (or
+			// a snapped port). Run out a bend radius first, then across, then back to the target; straight
+			// behind needs a sidestep of two bend radii to have room to turn round.
+			//
+			// When the route goes straight on from the target into the end pole (arrivesLevel, no plumb run in
+			// between), the run across can't head the opposite way to that final run or the pipe would double
+			// back on itself. Jog across halfway along instead, and reach the target along forward.
+			bool doublesBack = false;
+			auto addLevelRoute = [&](double z, bool arrivesLevel)
+			{
+				const FVector2D from(corners.Last());
+				const FVector2D toEnd = levelTarget2D - from;
+				if (toEnd.Size() < 1.0)
+					return;
+				const double ahead = FVector2D::DotProduct(toEnd, forward);
+				const double lateral = FVector2D::DotProduct(toEnd, left);
+				const double straightTolerance = isFreeStart ? 0.0 : ahead * 0.0633;
+				if (ahead >= 1.0)
+				{
+					if (FMath::Abs(lateral) > FMath::Max(straightTolerance, 1.0))
+					{
+						const FVector2D across = lateral > 0.0 ? left : -left;
+						if (arrivesLevel && FVector2D::DotProduct(across, endArriveDirection) < -0.5)
+						{
+							const FVector2D jog = from + forward * (ahead / 2.0);
+							corners.Add(FVector(jog, z));
+							corners.Add(FVector(jog + left * lateral, z));
+						}
+						else
+						{
+							corners.Add(FVector(from + forward * ahead, z));
+						}
+					}
+				}
+				else
+				{
+					const FVector2D runOut = from + forward * bendRadius;
+					corners.Add(FVector(runOut, z));
+					doublesBack = true;
+					if (FMath::Abs(lateral) >= 1.0)
+					{
+						corners.Add(FVector(runOut + left * lateral, z));
+					}
+					else
+					{
+						corners.Add(FVector(runOut + left * (2.0 * bendRadius), z));
+						corners.Add(FVector(levelTarget2D + left * (2.0 * bendRadius), z));
+					}
+				}
+				corners.Add(FVector(levelTarget2D, z));
+			};
+
+			if (isVerticalStart)
+			{
+				// Vertical start: plumb run to the end's height first, then the level route.
+				if (isFreeStart && !isWallStart && hasHeight && !forward.IsZero())
+				{
+					// A floor pole's connector faces sideways even when the start normal is vertical (a pole
+					// hung from a ceiling). Leave it sideways and bend into the plumb run, or the pipe would come
+					// out of the side of the pole.
+					corners.Add(FVector(FVector2D(routeStart) + forward * bendRadius, routeStart.Z));
+				}
+				if (endArrivesPlumb && FVector2D::Distance(FVector2D(corners.Last()), end2D) < 2.0 * bendRadius)
+				{
+					// Plumb at both ends and (nearly) above each other: one straight pipe. Wall poles don't always
+					// line up to the centimetre, and a jog that small would be two squeezed bends, which the game
+					// rejects as an invalid shape.
+				}
+				else if (endArrivesPlumb)
+				{
+					// Plumb at both ends: the level route goes halfway up (or down), so that a pole straight
+					// above the start is one straight pipe.
+					const double levelZ = (routeStart.Z + endLocation.Z) / 2.0;
+					corners.Add(FVector(FVector2D(corners.Last()), levelZ));
+					addLevelRoute(levelZ, false);
+				}
+				else if (hasLead && hasHeight
+					&& FVector2D::DotProduct(levelTarget2D - FVector2D(corners.Last()), endArriveDirection) < -1.0)
+				{
+					// The end is reached coming back towards the start, so the level route has to pass it before
+					// turning in. Make it halfway up (or down) and drop to the end's height at the lead point, so
+					// the route doesn't run back along itself.
+					const double levelZ = (routeStart.Z + endLocation.Z) / 2.0;
+					corners.Add(FVector(FVector2D(corners.Last()), levelZ));
+					addLevelRoute(levelZ, false);
+					corners.Add(FVector(levelTarget2D, endLocation.Z));
+				}
+				else
+				{
+					if (hasHeight)
+						corners.Add(FVector(FVector2D(corners.Last()), endLocation.Z));
+					addLevelRoute(endLocation.Z, true);
+				}
+			}
+			else
+			{
+				// Horizontal start: the level route first, then a plumb run at the lead point (unless the final run
+				// ramps the height instead).
+				const bool hasPlumbRun = hasHeight && !rampsHeight;
+				const double intoWall = isWallStart ? FVector::DotProduct(endLocation - startLocation, -startWallNormal) : 0.0;
+				if (hasPlumbRun && intoWall >= 1.0)
+				{
+					// From a wall, an end on the wall's far side (on top of the foundations it's on, say) is
+					// reached by going along the wall, plumb up (or down) its face, and only then across, so the
+					// pipe doesn't run through the wall.
+					//
+					// When the end is reached heading back towards the wall, crossing straight to it would fold
+					// back on itself. Climb two bend radii further along instead, cross beyond the end, and step
+					// back to it, which leaves a full radius for each bend.
+					const FVector2D intoWall2D = FVector2D(-startWallNormal.X, -startWallNormal.Y).GetSafeNormal();
+					const bool arrivesFromBeyond = FVector2D::DotProduct(endArriveDirection, intoWall2D) < -0.5;
+					const double sidestep = arrivesFromBeyond ? 2.0 * bendRadius : 0.0;
+					const double along = FVector2D::DotProduct(levelTarget2D - FVector2D(routeStart), forward) + sidestep;
+					const FVector2D turn = FVector2D(routeStart) + forward * along;
+					// An end entered plumb (a wall pole turned up or down) is crossed to two bend radii short of
+					// its height, so the pipe can turn up (or down) into it.
+					const double crossZ = endArrivesPlumb
+						? endLocation.Z - FMath::Sign(endLocation.Z - routeStart.Z) * 2.0 * bendRadius
+						: endLocation.Z;
+					corners.Add(FVector(turn, routeStart.Z));
+					corners.Add(FVector(turn, crossZ));
+					if (arrivesFromBeyond)
+						corners.Add(FVector(levelTarget2D + forward * sidestep, crossZ));
+					corners.Add(FVector(levelTarget2D, crossZ));
+				}
+				else
+				{
+					addLevelRoute(routeStart.Z, !hasPlumbRun);
+					if (hasPlumbRun)
+						corners.Add(FVector(levelTarget2D, endLocation.Z));
+				}
+			}
+			corners.Add(endLocation);
+
+			// Drop corners that coincide with a neighbour, or sit on a straight run between them. Left in, a
+			// straight-through corner would split its run in two, and the bends either side would only get half
+			// of each piece.
+			for (int32 i = corners.Num() - 2; i >= 1; --i)
+			{
+				if ((corners[i] - corners[i + 1]).Size() < 1.0 || (corners[i] - corners[i - 1]).Size() < 1.0
+					|| FVector::DotProduct((corners[i] - corners[i - 1]).GetSafeNormal(), (corners[i + 1] - corners[i]).GetSafeNormal()) > 0.9999)
+					corners.RemoveAt(i);
+			}
+
+			// Spline points in world space, joined by straight runs and corner arcs.
+			struct FRoutePoint
+			{
+				FVector Location;
+				FVector ArriveTangent;
+				FVector LeaveTangent;
+			};
+			TArray<FRoutePoint> route;
+			route.Add({ startLocation, FVector::ZeroVector, FVector::ZeroVector });
+
+			// A straight run to location; returns false (and adds nothing) when it would be too short.
+			auto addRun = [&](const FVector& location)
+			{
+				const FVector tangent = location - route.Last().Location;
+				if (tangent.Size() < 1.0)
+					return false;
+				route.Last().LeaveTangent = tangent;
+				route.Add({ location, tangent, tangent });
+				return true;
+			};
+
+			const double maxRadius = hologram->mBendRadius;
+			double minRadius = maxRadius;
+			double plumbPortBendRadius = maxRadius;
+			bool foldsBack = false;
+			for (int32 i = 1; i < corners.Num() - 1; ++i)
+			{
+				const FVector before = corners[i] - corners[i - 1];
+				const FVector after = corners[i + 1] - corners[i];
+				const FVector arriveDirection = before.GetSafeNormal();
+				const FVector leaveDirection = after.GetSafeNormal();
+				const double angle = FMath::Acos(FMath::Clamp(FVector::DotProduct(arriveDirection, leaveDirection), -1.0, 1.0));
+				if (angle < 1e-3)
+					continue;
+				// Turning straight back on itself (an end reached going the opposite way along the same line)
+				// can't be made with a bend: fall back to the auto route.
+				if (angle > 0.95 * UE_PI)
+				{
+					foldsBack = true;
+					continue;
+				}
+
+				// The arc starts and ends this far from the corner. Inner runs are shared by two corners.
+				const double tanHalf = FMath::Tan(angle / 2.0);
+				const double availableBefore = i == 1 ? before.Size() : before.Size() / 2.0;
+				const double availableAfter = i == corners.Num() - 2 ? after.Size() : after.Size() / 2.0;
+				const double cornerDistance = FMath::Min3(maxRadius * tanHalf, availableBefore, availableAfter);
+				const double radius = cornerDistance / tanHalf;
+				if (endsOnPlumbPort && endsInPassthrough && i == corners.Num() - 2)
+					plumbPortBendRadius = radius;
+				else
+					minRadius = FMath::Min(minRadius, radius);
+
+				// Hermite tangent length of a cubic approximating the arc.
+				const double handle = 4.0 * radius * FMath::Tan(angle / 4.0);
+
+				if (!addRun(corners[i] - arriveDirection * cornerDistance))
+					route.Last().Location = corners[i] - arriveDirection * cornerDistance;
+				route.Last().LeaveTangent = arriveDirection * handle;
+				const FVector arcEnd = corners[i] + leaveDirection * cornerDistance;
+				route.Add({ arcEnd, leaveDirection * handle, leaveDirection * handle });
+			}
+			if (!addRun(endLocation))
+				route.Last().Location = endLocation;
+
+			route[0].ArriveTangent = route[0].LeaveTangent;
+			if (route.Num() < 2)
+				return;
+
+			// When the ends are too close for the route's bends, it either squeezes a bend tighter than the bend
+			// radius, or loops round to make room (an end just behind or beside the start). Fall back to the
+			// game's auto route for those: RouteSelectedSplineMode already routed our mode with AutoRouteSpline,
+			// and mSplineData hasn't been touched yet. Two exceptions: when the end pole was turned to face the
+			// way the start faces and the two bends share the room (sharesRoom), they may go down to half the
+			// radius; and the bend down (or up) into a pipe hole may go as tight as the game
+			// allows, to fit whatever drop there is. A route that runs out and turns straight back into the end
+			// (two supports side by side facing the same way) has its bends right at the ports, which only looks
+			// right when the supports are well apart.
+			double pathLength = 0.0;
+			for (int32 i = 1; i < corners.Num(); ++i)
+				pathLength += FVector::Dist(corners[i - 1], corners[i]);
+			const double directLength = FVector::Dist(startLocation, endLocation);
+			const double smallestRadius = sharesRoom ? FMath::Max(0.49 * maxRadius, (double)hologram->mMinBendRadius) : 0.98 * maxRadius;
+			const TCHAR* fallbackReason = nullptr;
+			if (foldsBack)
+				fallbackReason = TEXT("folds back on itself");
+			else if (minRadius < smallestRadius)
+				fallbackReason = TEXT("bend too tight");
+			else if (plumbPortBendRadius < hologram->mMinBendRadius)
+				fallbackReason = TEXT("bend into pipe hole too tight");
+			else if (doublesBack && directLength < 8.0 * maxRadius && FVector2D::DotProduct(endArriveDirection, forward) < -0.5)
+				fallbackReason = TEXT("turns straight back into a close port");
+			else if (endArrivesPlumb && corners.Num() >= 2
+				&& FMath::Abs((corners.Last() - corners[corners.Num() - 2]).GetSafeNormal().Z) < 0.7)
+				fallbackReason = TEXT("plumb end not reached on a plumb run");
+			else if (directLength < 4.0 * maxRadius && pathLength > 2.0 * directLength)
+				fallbackReason = TEXT("loops round a close end");
+
+			// Diagnostics, logged only when something changes.
+			{
+				static FString lastRouteState;
+				FString cornerList;
+				for (const FVector& corner : corners)
+					cornerList += corner.ToCompactString() + TEXT(" ");
+				const FString routeState = FString::Printf(
+					TEXT("BetterStraight route: %s | wallStart=%d gameStartNormal=%s startNormal=%s forward=%s arrive=%s plumbEnd=%d minRadius=%.0f | corners %s"),
+					fallbackReason ? fallbackReason : TEXT("used"), isWallStart ? 1 : 0,
+					*gameStartNormal.ToCompactString(), *startNormal.ToCompactString(), *forward.ToString(),
+					*endArriveDirection.ToString(), endArrivesPlumb ? 1 : 0, minRadius, *cornerList);
+				if (routeState != lastRouteState)
+				{
+					UE_LOG(LogVerticalLogisticsQoL, Display, TEXT("%s"), *routeState);
+					lastRouteState = routeState;
+				}
+			}
+			if (fallbackReason != nullptr)
+				return;
+
+			if (!endWallNormal.IsZero())
+			{
+				const FVector passAxis = endArrivesPlumb ? FVector::UpVector : FVector(endArriveDirection, 0.0);
+				GPipeEndWallPole.Add(hologram, { endWallPole, endWallNormal, passAxis });
+			}
+			if (squaredStartWallPole.IsSet())
+				GPipeStartWallPole.Add(hologram, squaredStartWallPole.GetValue());
+
+			// mSplineData is in the hologram's local space.
+			const FTransform& transform = hologram->GetActorTransform();
+			TArray<FSplinePointData>& points = hologram->mSplineData;
+			points.Reset(route.Num());
+			for (const FRoutePoint& point : route)
+			{
+				points.Emplace(transform.InverseTransformPosition(point.Location),
+					transform.InverseTransformVector(point.ArriveTangent), transform.InverseTransformVector(point.LeaveTangent));
 			}
 		});
 }

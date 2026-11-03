@@ -27,3 +27,16 @@ public:
 		mDisplayName = INVTEXT("Vertical (Down)");
 	}
 };
+
+/// Builds a pipe as one straight segment from start to end, at any angle in both the horizontal and
+/// vertical axes.
+UCLASS()
+class VERTICALLOGISTICSQOL_API UVLQoLPipeBetterStraightBuildMode : public UFGHologramBuildModeDescriptor
+{
+	GENERATED_BODY()
+public:
+	UVLQoLPipeBetterStraightBuildMode()
+	{
+		mDisplayName = INVTEXT("Better Straight");
+	}
+};

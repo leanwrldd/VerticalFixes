@@ -23,6 +23,7 @@ private:
 	void AllowConnectionToExistingAttachment();
 	void HideLiftArrowWhenSnappedTopToAttachment();
 	void PrepareCustomAttachmentHologram();
+	void AddPipeBetterStraightBuildMode();
 	void NetworkVerticalAttachmentFlowDirection();
 	void NetworkLiftMeshRotationFlag();
 };

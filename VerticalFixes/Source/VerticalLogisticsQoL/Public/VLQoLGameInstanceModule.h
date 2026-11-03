@@ -46,6 +46,10 @@ protected:
 private:
 	void FinishSetup(const FStreamableHandle* loadRequest);
 
+	/// Copies the current settings into the globals the hooks read.
+	UFUNCTION()
+	void ReadSettings();
+
 	UPROPERTY()
 	TArray<TObjectPtr<UObject>> CDOEdits;
 

@@ -5,15 +5,12 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Buildables/FGBuildableConveyorAttachment.h"
 #include "Components/MeshComponent.h"
-#include "Configuration/ConfigManager.h"
-#include "Configuration/Properties/ConfigPropertyBool.h"
-#include "Configuration/Properties/ConfigPropertySection.h"
 #include "Engine/AssetManager.h"
 #include "FGFactoryConnectionComponent.h"
 #include "Hologram/FGConveyorAttachmentHologram.h"
 #include "Module/GameInstanceModuleManager.h"
 #include "VerticalLogisticsQoL.h"
-#include "VLQoLModConfiguration.h"
+#include "VLQoLRuntimeProperties.h"
 
 UVLQoLGameInstanceModule* UVLQoLGameInstanceModule::Get(UObject* worldContext)
 {
@@ -118,27 +115,7 @@ struct CountComponents
 
 void UVLQoLGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase phase)
 {
-	// The base class registers ModConfigurations at INITIALIZATION. Adding it here rather than in a
-	// constructor keeps it registered whatever the Blueprint subclass has serialised for the array.
-	if (phase == ELifecyclePhase::INITIALIZATION)
-		ModConfigurations.AddUnique(UVLQoLModConfiguration::StaticClass());
-
 	Super::DispatchLifecycleEvent(phase);
-
-	if (phase == ELifecyclePhase::POST_INITIALIZATION)
-	{
-		if (UConfigManager* configManager = GetGameInstance()->GetSubsystem<UConfigManager>())
-		{
-			FConfigId configId;
-			configId.ModReference = TEXT("VerticalFixes");
-			if (UConfigPropertySection* root = configManager->GetConfigurationRootSection(configId))
-			{
-				if (UConfigProperty* property = root->SectionProperties.FindRef(UVLQoLModConfiguration::ReplaceVanillaStraightKey))
-					property->OnPropertyValueChanged.AddDynamic(this, &UVLQoLGameInstanceModule::ReadSettings);
-			}
-		}
-		ReadSettings();
-	}
 
 	if (!WITH_EDITOR && phase == ELifecyclePhase::POST_INITIALIZATION)
 	{
@@ -159,24 +136,6 @@ void UVLQoLGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase phase)
 			}
 		}
 	}
-}
-
-void UVLQoLGameInstanceModule::ReadSettings()
-{
-	bool replaceVanillaStraight = true;
-	if (UConfigManager* configManager = GetGameInstance()->GetSubsystem<UConfigManager>())
-	{
-		FConfigId configId;
-		configId.ModReference = TEXT("VerticalFixes");
-		if (UConfigPropertySection* root = configManager->GetConfigurationRootSection(configId))
-		{
-			if (auto* property = Cast<UConfigPropertyBool>(root->SectionProperties.FindRef(UVLQoLModConfiguration::ReplaceVanillaStraightKey)))
-				replaceVanillaStraight = property->Value;
-		}
-	}
-	GVLQoLReplaceVanillaStraight = replaceVanillaStraight;
-	UE_LOG(LogVerticalLogisticsQoL, Display, TEXT("Better Straight replaces vanilla Straight: %s"),
-		replaceVanillaStraight ? TEXT("yes") : TEXT("no"));
 }
 
 void UVLQoLGameInstanceModule::FinishSetup(const FStreamableHandle* loadRequest)
@@ -278,7 +237,7 @@ void UVLQoLGameInstanceModule::FinishSetup(const FStreamableHandle* loadRequest)
 
 		// We only know how to deal with buildables that have a single override, but the game treats null
 		// overrides as if they don't exist so we should try to support that too.
-		for (const UFGHologramOverride* currentHologramOverride : buildable->mHologramOverrides)
+		for (const UFGHologramOverride* currentHologramOverride : VLQoLRuntimeProperties::GetHologramOverrides(buildable))
 		{
 			if (currentHologramOverride != nullptr)
 			{

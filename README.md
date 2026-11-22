@@ -2,7 +2,7 @@ Fixes a bunch of logistics bugs and annoyances: belts, lifts, pipes, mergers and
 
 ## What it fixes
 
-Improves the logic of the Straight build mode for pipes, and fixes lifts and vertical attachments.
+Fixes lifts and vertical attachments. The Better Straight pipe build mode that used to be here has moved to the Follow Terrain (Terrain Belts) mod.
 
 ## Reported issues it addresses
 
@@ -16,14 +16,6 @@ Improves the logic of the Straight build mode for pipes, and fixes lifts and ver
 - [Merger and splitter not going back into normal in the build menu after aiming at a vertical conveyor](https://questions.satisfactorygame.com/post/6802bdc96b7c573196367ce9)
 - [Feature Request: Independently-buildable Vertical Merger/Splitter, and/or snap to floor holes](https://questions.satisfactorygame.com/post/67ec19966b7c573196362493)
 - [Changing the input location on Vertical Splitters/Mergers](https://questions.satisfactorygame.com/post/67ec1e606b7c5731963624c6)
-- [pipe straight build mode improvement](https://questions.satisfactorygame.com/post/6832e1786b7c57319637c58a)
-- [Make "Horizontal to Vertical" pipes work for 2m height difference](https://questions.satisfactorygame.com/post/67172581ddb9d97e07205b80)
-- [Pipes' "Horizontal to Vertical" build doesn't work in said direction](https://questions.satisfactorygame.com/post/617f0786831c852052357f1d)
-- [Something is wrong with horizontal to vertical pipe placement](https://questions.satisfactorygame.com/post/69e4019eb4a0d6184725c98b)
-- [Pipe Vertical mode produces inconsistent and unreliable results](https://questions.satisfactorygame.com/post/5e8065e06f3c82fe950aaec4)
-- [Issue when placing H-to-V pipe section that should be possible](https://questions.satisfactorygame.com/post/6719372eddb9d97e07206e79)
-- [Horizontal-to-Vertical build mode for pipes/hypertubes just does not work anymore](https://questions.satisfactorygame.com/post/6383e85cca608e080352728e)
-- [Pipes: Horizontal to Vertical not functioning properly](https://questions.satisfactorygame.com/post/6563a780d0053b102f18f7e7)
 
 ## Known limitations
 

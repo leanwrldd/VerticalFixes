@@ -46,25 +46,150 @@ bool CanConnectVertically(const AFGConveyorLiftHologram* lift, const UFGFactoryC
 	return true;
 }
 
-// Adding a replicated property to a class (or flagging an existing one CPF_Net) renumbers the
-// RepIndex of every replicated property after it. A subclass whose replication data was already
-// set up keeps the old numbering, so one of its properties and one of the base class's end up
-// sharing a RepIndex with different conditions, and RegisterReplicatedLifetimeProperty asserts
-// ("registered twice with different conditions") the first time a client is sent that actor.
-// Clearing the flag on the whole loaded hierarchy makes every class rebuild its numbering
-// consistently; classes loaded later inherit the base's current numbering anyway.
-void InvalidateReplicationDataForHierarchy(UClass* baseClass)
+// Extra replicated bools that this mod adds to game classes.
+//
+// They must NOT be added to a native class. Native code registers its replicated properties with
+// RepIndex values baked in at compile time (DOREPLIFETIME_WITH_PARAMS_FAST, push model). Adding a
+// replicated property to a native class, or flagging an existing one CPF_Net, renumbers every
+// replicated property after it at runtime while the compiled numbers stay where they were, so one
+// of the game's properties and ours end up sharing a RepIndex with different conditions.
+// RegisterReplicatedLifetimeProperty then asserts ("Condition == Other.Condition") on the host the
+// first time a client is sent that actor. 1.2 made this fatal for attachments: the new replicated
+// AFGBuildableConveyorAttachment::mFactoryConnectionStates sits exactly where mIsUpwardsFlow used to
+// be linked in. Native subclasses (smart splitter, priority merger) have compiled numbers too, so
+// appending to the end of the native class is no safer.
+//
+// Blueprint classes look their RepIndex up at runtime, and their replicated properties are always
+// numbered after every native one. So each extra property is owned by the first blueprint class
+// below the native hierarchy (the "blueprint root") and aliases memory in the native base. No
+// native class is ever renumbered.
+struct FExtraRepBool
 {
+	UClass* NativeBase = nullptr;
+	FName Name;
+	int32 Offset = 0;
+	TMap<UClass*, FBoolProperty*> PropertyByRoot;
+};
+
+// FProperty::SetOffset_Internal is protected; reach it through a derived type.
+struct FPropertyOffsetSetter : FProperty
+{
+	static void Set(FProperty* prop, int32 offset) { static_cast<FPropertyOffsetSetter*>(prop)->SetOffset_Internal(offset); }
+};
+
+TArray<FExtraRepBool*>& GetExtraRepBools()
+{
+	static TArray<FExtraRepBool*> extraRepBools;
+	return extraRepBools;
+}
+
+UClass* FindBlueprintRoot(UClass* cls, const UClass* nativeBase)
+{
+	if (cls == nullptr || !cls->IsChildOf(nativeBase))
+		return nullptr;
+
+	UClass* root = nullptr;
+	for (UClass* curr = cls; curr != nullptr && !curr->HasAnyClassFlags(CLASS_Native); curr = curr->GetSuperClass())
+	{
+		root = curr;
+	}
+	return root;
+}
+
+FBoolProperty* FindExtraRepBool(const FExtraRepBool& extra, UClass* cls)
+{
+	UClass* root = FindBlueprintRoot(cls, extra.NativeBase);
+	FBoolProperty* const* found = root ? extra.PropertyByRoot.Find(root) : nullptr;
+	return found ? *found : nullptr;
+}
+
+// Called before a class builds its replication data. Runs before the blueprint root's own
+// SetUpRuntimeReplicationData, because subclasses recurse into their super class first.
+void AddExtraRepBoolsToClass(UClass* cls)
+{
+	if (cls->HasAnyClassFlags(CLASS_Native | CLASS_ReplicationDataIsSetUp))
+		return;
+	const UClass* super = cls->GetSuperClass();
+	if (super == nullptr || !super->HasAnyClassFlags(CLASS_Native))
+		return;	// Only the blueprint root gets the property; its subclasses inherit it.
+
+	for (FExtraRepBool* extra : GetExtraRepBools())
+	{
+		if (!cls->IsChildOf(extra->NativeBase) || extra->PropertyByRoot.Contains(cls))
+			continue;
+
+		FBoolProperty* prop = new FBoolProperty(cls, extra->Name, RF_Public | RF_Transient);
+		prop->SetBoolSize(sizeof(bool), true);
+		prop->SetPropertyFlags(CPF_Net | CPF_Transient | CPF_NativeAccessSpecifierPrivate);
+		FPropertyOffsetSetter::Set(prop, extra->Offset);
+		prop->SetBlueprintReplicationCondition(COND_InitialOnly);
+
+		// Put it at the TAIL of the owned property list, whichever way the constructor linked it.
+		// UBlueprintGeneratedClass::GetLifetimeBlueprintReplicationList stops after
+		// NumReplicatedProperties, so at the tail it never reaches ours and we register it ourselves.
+		for (FField** link = &cls->ChildProperties; *link != nullptr; link = &(*link)->Next)
+		{
+			if (*link == prop)
+			{
+				*link = prop->Next;
+				break;
+			}
+		}
+		prop->Next = nullptr;
+		FField** tail = &cls->ChildProperties;
+		while (*tail != nullptr)
+			tail = &(*tail)->Next;
+		*tail = prop;
+
+		extra->PropertyByRoot.Add(cls, prop);
+		UE_LOG(LogVerticalLogisticsQoL, Log, TEXT("Added replicated %s to %s."), *extra->Name.ToString(), *cls->GetName());
+	}
+}
+
+void RegisterExtraRepBool(FExtraRepBool* extra)
+{
+	GetExtraRepBools().Add(extra);
+
+	// Blueprint classes that already built their replication data must rebuild it with the new
+	// property. Nothing has been replicated yet at module startup, so no RepLayout is stale. Native
+	// classes are untouched and keep theirs.
 	int32 invalidated = 0;
 	for (TObjectIterator<UClass> it; it; ++it)
 	{
-		if (it->IsChildOf(baseClass))
+		if (it->IsChildOf(extra->NativeBase) && !it->HasAnyClassFlags(CLASS_Native))
 		{
 			it->ClassFlags &= ~CLASS_ReplicationDataIsSetUp;
 			++invalidated;
 		}
 	}
-	UE_LOG(LogVerticalLogisticsQoL, Log, TEXT("Invalidated replication data for %d class(es) under %s."), invalidated, *baseClass->GetName());
+	UE_LOG(LogVerticalLogisticsQoL, Log, TEXT("Replicating %s on blueprint subclasses of %s (%d already loaded)."),
+		*extra->Name.ToString(), *extra->NativeBase->GetName(), invalidated);
+
+	static bool hooked = false;
+	if (!hooked)
+	{
+		hooked = true;
+		SUBSCRIBE_METHOD(UClass::SetUpRuntimeReplicationData,
+			[](auto& scope, UClass* self)
+			{
+				AddExtraRepBoolsToClass(self);
+			});
+	}
+}
+
+// Registers an extra bool without ever asserting: if anything already holds its RepIndex, skip it.
+void RegisterExtraRepLifetime(const FExtraRepBool& extra, UClass* cls, TArray<FLifetimeProperty>& OutLifetimeProps, ELifetimeCondition condition)
+{
+	const FBoolProperty* prop = FindExtraRepBool(extra, cls);
+	if (prop == nullptr)
+		return;
+	if (OutLifetimeProps.ContainsByPredicate([prop](const FLifetimeProperty& p) { return p.RepIndex == prop->RepIndex; }))
+	{
+		UE_LOG(LogVerticalLogisticsQoL, Warning, TEXT("%s on %s: RepIndex %d is already registered, not replicating it."),
+			*extra.Name.ToString(), *cls->GetName(), (int32)prop->RepIndex);
+		return;
+	}
+	RegisterReplicatedLifetimeProperty(prop, OutLifetimeProps, { .Condition = condition });
 }
 
 } // namespace
@@ -693,75 +818,27 @@ void FVerticalLogisticsQoLModule::NetworkVerticalAttachmentFlowDirection()
 
 	static_assert(isUpwardsFlowOffset + sizeof(bool) <= STRUCT_OFFSET(AFGBuildableConveyorAttachment, mHologramOverrides));
 
-	// Creates the property and registers it with the networking system.
+	static FExtraRepBool isUpwardsFlowRep;
+	isUpwardsFlowRep.NativeBase = buildableClass;
+	isUpwardsFlowRep.Name = TEXT("mIsUpwardsFlow");
+	isUpwardsFlowRep.Offset = isUpwardsFlowOffset;
+	RegisterExtraRepBool(&isUpwardsFlowRep);
+
 	class LifetimeRepHook
 	{
 	public:
-		explicit LifetimeRepHook(UClass* buildableClass)
-		{
-			using namespace UECodeGen_Private;
-
-			FProperty* prevProperty = FindPreviousProperty(
-				buildableClass,
-				GET_MEMBER_NAME_CHECKED(AFGBuildableConveyorAttachment, mHologramOverrides));
-
-			check(prevProperty);
-			check(prevProperty->GetOffset_ForDebug() + prevProperty->GetSize() <= isUpwardsFlowOffset);
-
-			IsUpwardsFlowProperty = new FBoolProperty(buildableClass, FBoolPropertyParams
-			{
-				.NameUTF8 = "mIsUpwardsFlow",
-				.PropertyFlags = CPF_Net | CPF_Transient | CPF_NativeAccessSpecifierPrivate,
-				.Flags = EPropertyGenFlags::Bool | EPropertyGenFlags::NativeBool,
-				.ArrayDim = 1,
-				.ElementSize = sizeof(bool),
-				.SizeOfOuter = sizeof(AFGBuildableConveyorAttachment),
-				.SetBitFunc = [](void* o) { *(bool*)((unsigned char*)o + isUpwardsFlowOffset) = true; },
-			});
-
-			// By default the property gets added to the front of the property list, but we're re-linking it to
-			// be where it was if it was declared naturally as part of the class.
-			check(buildableClass->ChildProperties == IsUpwardsFlowProperty);
-			check(buildableClass->PropertyLink != IsUpwardsFlowProperty);
-			buildableClass->ChildProperties = IsUpwardsFlowProperty->Next;
-			IsUpwardsFlowProperty->Next = prevProperty->Next;
-			IsUpwardsFlowProperty->PropertyLinkNext = prevProperty->PropertyLinkNext;
-			prevProperty->Next = IsUpwardsFlowProperty;
-			prevProperty->PropertyLinkNext = IsUpwardsFlowProperty;
-
-			InvalidateReplicationDataForHierarchy(buildableClass);
-		}
-
-		void operator()(const AFGBuildable* buildable, TArray<FLifetimeProperty>& OutLifetimeProps)
+		void operator()(const AFGBuildable* buildable, TArray<FLifetimeProperty>& OutLifetimeProps) const
 		{
 			auto* attachment = Cast<AFGBuildableConveyorAttachment>(buildable);
 			if (attachment == nullptr)
 				return;
 
-			RegisterReplicatedLifetimeProperty(IsUpwardsFlowProperty, OutLifetimeProps,
-			{
-				// Don't need networking for non-vertical attachments as their directions are all static.
-				.Condition = IsVerticalAttachment(attachment) ? COND_InitialOnly : COND_Never,
-			});
+			// Don't need networking for non-vertical attachments as their directions are all static.
+			RegisterExtraRepLifetime(isUpwardsFlowRep, attachment->GetClass(), OutLifetimeProps,
+				IsVerticalAttachment(attachment) ? COND_InitialOnly : COND_Never);
 		}
 
 	private:
-		static FProperty* FindPreviousProperty(UClass* cls, FName name)
-		{
-			FProperty* prev = nullptr;
-			FProperty* curr = cls->PropertyLink;
-
-			while (curr != nullptr)
-			{
-				if (curr->GetFName() == name)
-					return prev;
-				prev = curr;
-				curr = curr->PropertyLinkNext;
-			}
-
-			return nullptr;
-		}
-
 		static bool IsVerticalAttachment(const AFGBuildableConveyorAttachment* attachment)
 		{
 			for (const UFGHologramOverride* override : VLQoLRuntimeProperties::GetHologramOverrides(attachment))
@@ -771,8 +848,6 @@ void FVerticalLogisticsQoLModule::NetworkVerticalAttachmentFlowDirection()
 			}
 			return false;
 		}
-
-		FBoolProperty* IsUpwardsFlowProperty;
 	};
 
 	// Sets the new networked flag on the server, which the client uses to fix up the lift connection
@@ -842,7 +917,7 @@ void FVerticalLogisticsQoLModule::NetworkVerticalAttachmentFlowDirection()
 	};
 
 	auto* defaultBuildable = CastChecked<AFGBuildableConveyorAttachment>(buildableClass->GetDefaultObject());
-	SUBSCRIBE_METHOD_VIRTUAL_AFTER(AFGBuildable::GetLifetimeReplicatedProps, defaultBuildable, LifetimeRepHook(buildableClass));
+	SUBSCRIBE_METHOD_VIRTUAL_AFTER(AFGBuildable::GetLifetimeReplicatedProps, defaultBuildable, LifetimeRepHook());
 	SUBSCRIBE_METHOD_VIRTUAL_AFTER(AFGBuildableConveyorAttachment::BeginPlay, defaultBuildable, BeginPlayHook());
 }
 
@@ -857,16 +932,18 @@ void FVerticalLogisticsQoLModule::NetworkLiftMeshRotationFlag()
 	if (flagProperty == nullptr || flagProperty->HasAnyPropertyFlags(CPF_Net))
 		return;
 
-	flagProperty->SetPropertyFlags(CPF_Net);
-	InvalidateReplicationDataForHierarchy(liftClass);
+	// Not flagged CPF_Net on the native class: that renumbers mSnappedPassthroughs and
+	// mOpposingConnectionClearance (see FExtraRepBool). A blueprint-side alias replicates it instead.
+	static FExtraRepBool beltUsingInputRotation;
+	beltUsingInputRotation.NativeBase = liftClass;
+	beltUsingInputRotation.Name = TEXT("mIsBeltUsingInputRotation_VLQoL");
+	beltUsingInputRotation.Offset = flagProperty->GetOffset_ForInternal();
+	RegisterExtraRepBool(&beltUsingInputRotation);
 
 	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableConveyorLift, GetLifetimeReplicatedProps,
-		[flagProperty](const AFGBuildableConveyorLift* lift, TArray<FLifetimeProperty>& OutLifetimeProps)
+		[](const AFGBuildableConveyorLift* lift, TArray<FLifetimeProperty>& OutLifetimeProps)
 		{
-			RegisterReplicatedLifetimeProperty(flagProperty, OutLifetimeProps,
-			{
-				.Condition = COND_InitialOnly,
-			});
+			RegisterExtraRepLifetime(beltUsingInputRotation, lift->GetClass(), OutLifetimeProps, COND_InitialOnly);
 		});
 }
 

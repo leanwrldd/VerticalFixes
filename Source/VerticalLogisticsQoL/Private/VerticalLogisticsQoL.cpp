@@ -9,6 +9,7 @@
 #include "Hologram/FGConveyorLiftHologram.h"
 #include "Net/UnrealNetwork.h"
 #include "Patching/NativeHookManager.h"
+#include "UObject/UObjectIterator.h"
 #include "VLQoLBuildModes.h"
 #include "VLQoLGameInstanceModule.h"
 #include "VLQoLRuntimeProperties.h"
@@ -43,6 +44,27 @@ bool CanConnectVertically(const AFGConveyorLiftHologram* lift, const UFGFactoryC
 		return false;	// Wrong side.
 
 	return true;
+}
+
+// Adding a replicated property to a class (or flagging an existing one CPF_Net) renumbers the
+// RepIndex of every replicated property after it. A subclass whose replication data was already
+// set up keeps the old numbering, so one of its properties and one of the base class's end up
+// sharing a RepIndex with different conditions, and RegisterReplicatedLifetimeProperty asserts
+// ("registered twice with different conditions") the first time a client is sent that actor.
+// Clearing the flag on the whole loaded hierarchy makes every class rebuild its numbering
+// consistently; classes loaded later inherit the base's current numbering anyway.
+void InvalidateReplicationDataForHierarchy(UClass* baseClass)
+{
+	int32 invalidated = 0;
+	for (TObjectIterator<UClass> it; it; ++it)
+	{
+		if (it->IsChildOf(baseClass))
+		{
+			it->ClassFlags &= ~CLASS_ReplicationDataIsSetUp;
+			++invalidated;
+		}
+	}
+	UE_LOG(LogVerticalLogisticsQoL, Log, TEXT("Invalidated replication data for %d class(es) under %s."), invalidated, *baseClass->GetName());
 }
 
 } // namespace
@@ -707,7 +729,7 @@ void FVerticalLogisticsQoLModule::NetworkVerticalAttachmentFlowDirection()
 			prevProperty->Next = IsUpwardsFlowProperty;
 			prevProperty->PropertyLinkNext = IsUpwardsFlowProperty;
 
-			buildableClass->ClassFlags &= ~CLASS_ReplicationDataIsSetUp;
+			InvalidateReplicationDataForHierarchy(buildableClass);
 		}
 
 		void operator()(const AFGBuildable* buildable, TArray<FLifetimeProperty>& OutLifetimeProps)
@@ -836,7 +858,7 @@ void FVerticalLogisticsQoLModule::NetworkLiftMeshRotationFlag()
 		return;
 
 	flagProperty->SetPropertyFlags(CPF_Net);
-	liftClass->ClassFlags &= ~CLASS_ReplicationDataIsSetUp;
+	InvalidateReplicationDataForHierarchy(liftClass);
 
 	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableConveyorLift, GetLifetimeReplicatedProps,
 		[flagProperty](const AFGBuildableConveyorLift* lift, TArray<FLifetimeProperty>& OutLifetimeProps)

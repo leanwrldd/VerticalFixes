@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.7
+- Fixed a host crash when a client joins a multiplayer game ("Assertion failed: Condition == Other.Condition" in RegisterReplicatedLifetimeProperty). The networked flow-direction and lift-rotation flags now rebuild replication data for every splitter, merger and lift class, not just the base class.
+- Multiplayer and dedicated servers are still not fully tested.
+
 ## 1.2.6
 - Removed the Better Straight pipe build mode and its setting. It has moved to the Follow Terrain (Terrain Belts) mod.
 

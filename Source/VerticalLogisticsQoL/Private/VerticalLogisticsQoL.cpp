@@ -118,6 +118,33 @@ void AddExtraRepBoolsToClass(UClass* cls)
 		if (!cls->IsChildOf(extra->NativeBase) || extra->PropertyByRoot.Contains(cls))
 			continue;
 
+		// FRepLayout::InitFromClass checks that ClassReps are in ascending memory order
+		// (RepLayout.cpp "Cmds[Parents[i].CmdStart].Offset >= LastOffset"). Our alias is appended
+		// after every native replicated property, so its offset must not be below any of them, or
+		// the host crashes the first time it sends the actor to a client.
+		int32 highestRepOffset = INDEX_NONE;
+		const FProperty* highestRepProperty = nullptr;
+		for (TFieldIterator<FProperty> it(cls, EFieldIteratorFlags::IncludeSuper); it; ++it)
+		{
+			if (!it->HasAnyPropertyFlags(CPF_Net))
+				continue;
+			const int32 lastElementOffset = it->GetOffset_ForInternal() + it->GetElementSize() * (it->ArrayDim - 1);
+			if (lastElementOffset > highestRepOffset)
+			{
+				highestRepOffset = lastElementOffset;
+				highestRepProperty = *it;
+			}
+		}
+		if (extra->Offset < highestRepOffset)
+		{
+			UE_LOG(LogVerticalLogisticsQoL, Warning,
+				TEXT("Not replicating %s on %s: offset 0x%x is below replicated %s at 0x%x, which RepLayout rejects."),
+				*extra->Name.ToString(), *cls->GetName(), extra->Offset,
+				highestRepProperty ? *highestRepProperty->GetName() : TEXT("?"), highestRepOffset);
+			extra->PropertyByRoot.Add(cls, nullptr);	// Remember the decision; FindExtraRepBool then returns null.
+			continue;
+		}
+
 		FBoolProperty* prop = new FBoolProperty(cls, extra->Name, RF_Public | RF_Transient);
 		prop->SetBoolSize(sizeof(bool), true);
 		prop->SetPropertyFlags(CPF_Net | CPF_Transient | CPF_NativeAccessSpecifierPrivate);

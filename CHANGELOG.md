@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.9
+- Fixed another host crash when a client joins a multiplayer game. On some splitter, merger and lift classes the mod's networked flag sat below one of the game's replicated properties, which the engine rejects. The mod now skips that flag on those classes and logs a warning instead of crashing.
+- On the skipped classes, flow direction on multiplayer clients may be wrong. Multiplayer and dedicated servers are still not fully tested.
+
 ## 1.2.8
 - Really fixed the host crash when a client joins ("Assertion failed: Condition == Other.Condition"). 1.2.7 did not fix it. The cause: the game registers its own replicated properties with numbers fixed at compile time, and 1.2 added a replicated property to conveyor attachments right where the mod inserted its flow-direction flag, so the two collided. The mod's flags (attachment flow direction, lift mesh rotation) now live on the Blueprint building classes, which never shift the game's numbering.
 - Multiplayer and dedicated servers are still not fully tested.
